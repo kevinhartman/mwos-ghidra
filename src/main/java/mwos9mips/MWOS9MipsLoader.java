@@ -25,21 +25,26 @@ import ghidra.app.util.bin.ByteProvider;
 import ghidra.app.util.importer.MessageLog;
 import ghidra.app.util.opinion.AbstractLibrarySupportLoader;
 import ghidra.app.util.opinion.LoadSpec;
+import ghidra.app.util.opinion.Loader;
 import ghidra.framework.model.DomainObject;
 import ghidra.program.flatapi.FlatProgramAPI;
 import ghidra.program.model.address.Address;
+import ghidra.program.model.data.DataUtilities;
+import ghidra.program.model.data.DataUtilities.ClearDataMode;
 import ghidra.program.model.lang.LanguageCompilerSpecPair;
 import ghidra.program.model.listing.Program;
 import ghidra.program.model.mem.MemoryAccessException;
 import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.symbol.SourceType;
+import ghidra.program.model.util.CodeUnitInsertionException;
 import ghidra.util.exception.CancelledException;
 import ghidra.util.Msg;
 import ghidra.util.task.TaskMonitor;
 
 public class MWOS9MipsLoader extends AbstractLibrarySupportLoader {
 	public static final String MIPS_GP_VALUE_SYMBOL = "_mips_gp_value";
-	
+	public static final String MIPS_CP_VALUE_SYMBOL = "_mips_cp_value";
+
 	public static final String OPTION_NAME_CODE_BASE_ADDR = "Code Base Address";
 	public static final String OPTION_NAME_DATA_BASE_ADDR = "Data Base Address";
 	
@@ -53,8 +58,11 @@ public class MWOS9MipsLoader extends AbstractLibrarySupportLoader {
 	@Override
 	public Collection<LoadSpec> findSupportedLoadSpecs(ByteProvider provider) throws IOException {
 		BinaryReader reader = new BinaryReader(provider, false);
-        if (reader.readByteArray(0, 4).equals(new byte[] { 0x4D, (byte)0xAD }))
+		var sync = reader.readByteArray(0, 2);
+		
+        if (Arrays.equals(sync, new byte[] { 0x4D, (byte)0xAD }))
             return List.of(new LoadSpec(this, 0, new LanguageCompilerSpecPair("MIPS:BE:32:default", "default"), true));
+        
         return new ArrayList<>();
 	}
 
@@ -79,24 +87,35 @@ public class MWOS9MipsLoader extends AbstractLibrarySupportLoader {
 		
 		// Default: round up to next 4-byte boundary and create data segment
 		var dataStart = getDataBaseAddr(options, addressSpace.getAddress((codeStart.getOffset() + header.m_size + 4 - 1) / 4 * 4));
+		
+		// Get offset into data segment to place initialized data
+		reader.setPointerIndex(header.m_idata);
+		var offsetToIData = reader.readNextUnsignedInt();
+		var iDataStart = dataStart.getOffset() + offsetToIData;
+		var iDataSize = reader.readNextUnsignedInt();
+		
+		// Data preceding idata is uninitialized
 		createSegment(api,
 				null, 
 				".data", 
 				dataStart, 
-				header.m_data_sz, 
+				offsetToIData, 
 				false, false);
 		
-		// Get offset into data segment to place initialized data
-		reader.setPointerIndex(header.m_idata);
-		var offset_to_idata = reader.readNextUnsignedInt();
-		var idata_start = dataStart.getOffset() + offset_to_idata;
-		var idata_size = reader.readNextUnsignedInt();
-		
+		// Initialized data segment (idata)
 		createSegment(api, 
 				provider.getInputStream(header.m_idata), 
 				".idata", 
-				addressSpace.getAddress(idata_start), 
-				idata_size,
+				addressSpace.getAddress(iDataStart), 
+				iDataSize,
+				false, true);
+		
+		// Data following idata is uninitialized
+		createSegment(api,
+				null, 
+				".data2",
+				addressSpace.getAddress(iDataStart + iDataSize),
+				header.m_data_sz - ((iDataStart + iDataSize) - dataStart.getOffset()),
 				false, true);
 		
 		// Fix initialized data references
@@ -113,17 +132,38 @@ public class MWOS9MipsLoader extends AbstractLibrarySupportLoader {
 		// This allows the analyzer to find references to data through the static GP.
 		// TODO: implement this for FP as well (OS9 stores biased code start here)
 		var gpVal = addressSpace.getAddress(dataStart.getOffset() + 0x7ff0 /* bias */);
+		var cpVal = addressSpace.getAddress(codeStart.getOffset() + 0x7ff0 /* bias */);
 		try {
 			program.getSymbolTable().createLabel(gpVal, MIPS_GP_VALUE_SYMBOL, SourceType.IMPORTED);
+			program.getSymbolTable().createLabel(cpVal, MIPS_CP_VALUE_SYMBOL, SourceType.IMPORTED);
 		} catch (Exception ex) {
 			Msg.error(this, "Failed to initialize GP! Data references by code will be missing!", ex);
 		}
+		
+		// Add program entry
+		api.addEntryPoint(addressSpace.getAddress(codeStart.getOffset() + header.m_exec));
+        api.createFunction(addressSpace.getAddress(codeStart.getOffset() + header.m_exec), "_entry");
+        
+		// Add uninitialized trap handler if present
+		if (header.m_excpt != 0 && header.m_excpt != 0xFFFFFFFF) {
+			api.addEntryPoint(addressSpace.getAddress(codeStart.getOffset() + header.m_excpt));
+	        api.createFunction(addressSpace.getAddress(codeStart.getOffset() + header.m_excpt), "_except");
+		}
+		
+		// Set module header to data type
+		try {
+            DataUtilities.createData(program, codeStart, header.toDataType(), -1, false, ClearDataMode.CLEAR_ALL_UNDEFINED_CONFLICT_DATA);
+        } catch (CodeUnitInsertionException ex) {
+            Msg.error(this, "Failed to layout module header.", ex);
+        }
 	}
 	
 	private void applyRelocationTable(FlatProgramAPI api, BinaryReader reader, Address dataStart, long adjustBy) throws IOException, MemoryAccessException {
 		var addressSpace = dataStart.getAddressSpace();
 		var groupOffset = reader.readNextUnsignedShort();
 		var count = reader.readNextUnsignedShort();
+		
+		var idata = api.getMemoryBlock(".idata");
 		
 		while (!(groupOffset == 0 && count == 0)) {
 			// shifted since it forms the upper word of each address
@@ -146,10 +186,10 @@ public class MWOS9MipsLoader extends AbstractLibrarySupportLoader {
 	
 	private void createSegment(FlatProgramAPI api, InputStream input, String name, Address start, long length, boolean isCode, boolean overlay) {
         try {
-            MemoryBlock text = api.createMemoryBlock(name, start, input, length, overlay);
-            text.setRead(true);
-            text.setWrite(isCode ? false : true);
-            text.setExecute(isCode ? true : false);
+            MemoryBlock block = api.createMemoryBlock(name, start, input, length, false);
+            block.setRead(true);
+            block.setWrite(isCode ? false : true);
+            block.setExecute(isCode ? true : false);
         } catch (Exception e) {
             Msg.error(this, e.getMessage());
         }
@@ -161,14 +201,28 @@ public class MWOS9MipsLoader extends AbstractLibrarySupportLoader {
 		List<Option> list =
 			super.getDefaultOptions(provider, loadSpec, domainObject, isLoadIntoProgram);
 
-		list.add(new Option(OPTION_NAME_CODE_BASE_ADDR, 0x0));
-		list.add(new Option(OPTION_NAME_DATA_BASE_ADDR, Integer.class));
+		Address baseAddrDefault = null;
+		if (domainObject instanceof Program) {
+			Program program = (Program) domainObject;
+			var addressFactory = program.getAddressFactory();
+			if (addressFactory != null) {
+				var defaultAddressSpace = addressFactory.getDefaultAddressSpace();
+				if (defaultAddressSpace != null) {
+					baseAddrDefault = defaultAddressSpace.getAddress(0);
+				}
+			}
+		}
+		
+		list.add(new Option(OPTION_NAME_CODE_BASE_ADDR, baseAddrDefault, Address.class,
+				Loader.COMMAND_LINE_ARG_PREFIX + "-baseAddr"));
+		list.add(new Option(OPTION_NAME_DATA_BASE_ADDR, baseAddrDefault, Address.class,
+				Loader.COMMAND_LINE_ARG_PREFIX + "-baseAddrData"));
 
 		return list;
 	}
 	
 	private Address getCodeBaseAddr(List<Option> options, Address defaultVal) {
-		Address baseAddr = defaultVal;
+		Address baseAddr = null;
 		if (options != null) {
 			for (Option option : options) {
 				String optName = option.getName();
@@ -177,11 +231,11 @@ public class MWOS9MipsLoader extends AbstractLibrarySupportLoader {
 				}
 			}
 		}
-		return baseAddr;
+		return baseAddr != null ? baseAddr : defaultVal;
 	}
 	
 	private Address getDataBaseAddr(List<Option> options, Address defaultVal) {
-		Address baseAddr = defaultVal;
+		Address baseAddr = null;
 		if (options != null) {
 			for (Option option : options) {
 				String optName = option.getName();
@@ -190,7 +244,7 @@ public class MWOS9MipsLoader extends AbstractLibrarySupportLoader {
 				}
 			}
 		}
-		return baseAddr;
+		return baseAddr != null ? baseAddr : defaultVal;
 	}
 
 	@Override
