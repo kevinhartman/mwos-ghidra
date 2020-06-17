@@ -30,12 +30,12 @@ import ghidra.util.task.TaskMonitor;
 /**
  * TODO: Provide class-level documentation that describes what this exporter does.
  */
-public class MWOS9MipsExporter extends Exporter {
+public class OS9MipsExporter extends Exporter {
 
 	/**
 	 * Exporter constructor.
 	 */
-	public MWOS9MipsExporter() {
+	public OS9MipsExporter() {
 
 		// TODO: Name the exporter and associate a file extension with it
 

@@ -9,7 +9,16 @@ import ghidra.program.model.data.DataType;
 import ghidra.program.model.data.Structure;
 import ghidra.program.model.data.StructureDataType;
 
-public class MWOS9Header implements StructConverter {
+public class OS9Header implements StructConverter {
+    // Module types
+    static int MT_PROGRAM = 0x0001;
+    static int MT_DEVDRVR = 0x000e;
+    static int MT_DEVDESC = 0x000f;
+	
+    // Module langs
+    static int ML_ANY = 0;
+    static int ML_OBJECT = 1;
+    
     public byte[] m_sync;  // sync bytes for module identification
     public int m_sysrev;   // system revision check value
     
@@ -40,7 +49,15 @@ public class MWOS9Header implements StructConverter {
     public byte[] m_pad;
     public int m_parity;   // header parity
     
-    public MWOS9Header(BinaryReader reader) throws IOException {
+    int getType() {
+    	return (m_tylan >> 8) & 0xFF;
+    }
+    
+    int getLang() {
+    	return m_tylan & 0xFF;
+    }
+    
+    public OS9Header(BinaryReader reader) throws IOException {
         reader.setPointerIndex(0);
         m_sync = reader.readNextByteArray(2);
         m_sysrev = reader.readNextUnsignedShort();

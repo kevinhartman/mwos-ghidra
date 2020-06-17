@@ -41,18 +41,32 @@ import ghidra.util.exception.CancelledException;
 import ghidra.util.Msg;
 import ghidra.util.task.TaskMonitor;
 
-public class MWOS9MipsLoader extends AbstractLibrarySupportLoader {
+public abstract class OS9MipsModLoader extends AbstractLibrarySupportLoader {
+	public static class OS9MipsLoaderConfig {
+		boolean addExecutionEntry;
+		boolean addUninitializedTrapEntry;
+		int codeBias;
+		int dataBias;
+	}
+	
 	public static final String MIPS_GP_VALUE_SYMBOL = "_mips_gp_value";
 	public static final String MIPS_CP_VALUE_SYMBOL = "_mips_cp_value";
 
 	public static final String OPTION_NAME_CODE_BASE_ADDR = "Code Base Address";
 	public static final String OPTION_NAME_DATA_BASE_ADDR = "Data Base Address";
 	
-	public MWOS9Header header;
+	public OS9Header header;
+	
+	private final OS9MipsLoaderConfig config;
+	
+	public OS9MipsModLoader(OS9MipsLoaderConfig config) {
+		super();
+		this.config = config;
+	}
 	
 	@Override
 	public String getName() {
-		return "Microware OS9 for MIPS";
+		return "Microware OS9 Memory Module (MIPS)";
 	}
 
 	@Override
@@ -60,8 +74,15 @@ public class MWOS9MipsLoader extends AbstractLibrarySupportLoader {
 		BinaryReader reader = new BinaryReader(provider, false);
 		var sync = reader.readByteArray(0, 2);
 		
-        if (Arrays.equals(sync, new byte[] { 0x4D, (byte)0xAD }))
-            return List.of(new LoadSpec(this, 0, new LanguageCompilerSpecPair("MIPS:BE:32:default", "default"), true));
+        if (Arrays.equals(sync, new byte[] { 0x4D, (byte)0xAD })) {
+			var head = new OS9Header(reader);
+        	if (head.getLang() == OS9Header.ML_OBJECT) {
+        		// ok!
+                return List.of(new LoadSpec(this, 0, new LanguageCompilerSpecPair("MIPS:BE:32:default", "default"), true));
+			}
+        	
+			Msg.warn(this, "OS9 Ghidra loader only supports object code! This module's language value: " + head.getLang());
+        }
         
         return new ArrayList<>();
 	}
@@ -74,7 +95,7 @@ public class MWOS9MipsLoader extends AbstractLibrarySupportLoader {
 
 		BinaryReader reader = new BinaryReader(provider, false);
         FlatProgramAPI api = new FlatProgramAPI(program, monitor);
-		header = new MWOS9Header(reader);
+		header = new OS9Header(reader);
 		var codeStart = getCodeBaseAddr(options, addressSpace.getAddress(0));
 		
 		// Create module segment 
@@ -104,7 +125,7 @@ public class MWOS9MipsLoader extends AbstractLibrarySupportLoader {
 		
 		// Initialized data segment (idata)
 		createSegment(api, 
-				provider.getInputStream(header.m_idata), 
+				provider.getInputStream(header.m_idata + 8), 
 				".idata", 
 				addressSpace.getAddress(iDataStart), 
 				iDataSize,
@@ -131,8 +152,8 @@ public class MWOS9MipsLoader extends AbstractLibrarySupportLoader {
 		// Set GP :)
 		// This allows the analyzer to find references to data through the static GP.
 		// TODO: implement this for FP as well (OS9 stores biased code start here)
-		var gpVal = addressSpace.getAddress(dataStart.getOffset() + 0x7ff0 /* bias */);
-		var cpVal = addressSpace.getAddress(codeStart.getOffset() + 0x7ff0 /* bias */);
+		var gpVal = addressSpace.getAddress(dataStart.getOffset() + config.dataBias);
+		var cpVal = addressSpace.getAddress(codeStart.getOffset() + config.codeBias);
 		try {
 			program.getSymbolTable().createLabel(gpVal, MIPS_GP_VALUE_SYMBOL, SourceType.IMPORTED);
 			program.getSymbolTable().createLabel(cpVal, MIPS_CP_VALUE_SYMBOL, SourceType.IMPORTED);
@@ -140,14 +161,18 @@ public class MWOS9MipsLoader extends AbstractLibrarySupportLoader {
 			Msg.error(this, "Failed to initialize GP! Data references by code will be missing!", ex);
 		}
 		
-		// Add program entry
-		api.addEntryPoint(addressSpace.getAddress(codeStart.getOffset() + header.m_exec));
-        api.createFunction(addressSpace.getAddress(codeStart.getOffset() + header.m_exec), "_entry");
-        
-		// Add uninitialized trap handler if present
-		if (header.m_excpt != 0 && header.m_excpt != 0xFFFFFFFF) {
-			api.addEntryPoint(addressSpace.getAddress(codeStart.getOffset() + header.m_excpt));
-	        api.createFunction(addressSpace.getAddress(codeStart.getOffset() + header.m_excpt), "_except");
+		if (config.addExecutionEntry) {
+			// Add program entry
+			api.addEntryPoint(addressSpace.getAddress(codeStart.getOffset() + header.m_exec));
+	        api.createFunction(addressSpace.getAddress(codeStart.getOffset() + header.m_exec), "_entry");
+		}
+		
+		if (config.addUninitializedTrapEntry) {
+			// Add uninitialized trap handler if present
+			if (header.m_excpt != 0 && header.m_excpt != 0xFFFFFFFF) {
+				api.addEntryPoint(addressSpace.getAddress(codeStart.getOffset() + header.m_excpt));
+		        api.createFunction(addressSpace.getAddress(codeStart.getOffset() + header.m_excpt), "_except");
+			}
 		}
 		
 		// Set module header to data type
@@ -162,9 +187,7 @@ public class MWOS9MipsLoader extends AbstractLibrarySupportLoader {
 		var addressSpace = dataStart.getAddressSpace();
 		var groupOffset = reader.readNextUnsignedShort();
 		var count = reader.readNextUnsignedShort();
-		
-		var idata = api.getMemoryBlock(".idata");
-		
+				
 		while (!(groupOffset == 0 && count == 0)) {
 			// shifted since it forms the upper word of each address
 	        var base = dataStart.getOffset() + (groupOffset << 16);
@@ -244,7 +267,17 @@ public class MWOS9MipsLoader extends AbstractLibrarySupportLoader {
 				}
 			}
 		}
-		return baseAddr != null ? baseAddr : defaultVal;
+		
+		// only return user-provided data base address if it's not the same as the
+		// code base address (special case: put data at first word-aligned address after code).
+		if (baseAddr != null) {
+			var codeStart = getCodeBaseAddr(options, null);
+			if (codeStart != null && baseAddr.getOffset() != codeStart.getOffset()) {
+				return baseAddr;
+			}
+		}
+		
+		return defaultVal;
 	}
 
 	@Override
@@ -255,20 +288,24 @@ public class MWOS9MipsLoader extends AbstractLibrarySupportLoader {
 			
 			if (dataBase != null) {
 				BinaryReader reader = new BinaryReader(provider, false);
-				MWOS9Header header;
+				OS9Header header;
 				
 				try {
-					header = new MWOS9Header(reader);	
+					header = new OS9Header(reader);	
 				} catch (IOException ex) {
 					return "Failed to read from header while validating loader options: " + ex.getMessage();
 				}
 				
-				if (dataBase.getOffset() >= codeBase.getOffset() && dataBase.getOffset() < codeBase.getOffset() + header.m_size) {
-					return "Data start overlaps with code!";
-				}
-				
-				if (codeBase.getOffset() >= dataBase.getOffset() && codeBase.getOffset() < dataBase.getOffset() + header.m_data_sz) {
-					return "Code start overlaps with data!";
+				if (dataBase.getOffset() != codeBase.getOffset()) {
+					if (dataBase.getOffset() >= codeBase.getOffset() && dataBase.getOffset() < codeBase.getOffset() + header.m_size) {
+						return "Data start overlaps with code!";
+					}
+					
+					if (codeBase.getOffset() >= dataBase.getOffset() && codeBase.getOffset() < dataBase.getOffset() + header.m_data_sz) {
+						return "Code start overlaps with data!";
+					}
+				} else {
+					Msg.info(this, "Data start will be first word-aligned address following code.");
 				}
 			}
 		}

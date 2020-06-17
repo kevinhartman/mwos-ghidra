@@ -44,7 +44,7 @@ import resources.Icons;
 	description = "Plugin long description goes here."
 )
 //@formatter:on
-public class MWOS9MipsPlugin extends ProgramPlugin {
+public class OS9MipsPlugin extends ProgramPlugin {
 
 	MyProvider provider;
 
@@ -53,7 +53,7 @@ public class MWOS9MipsPlugin extends ProgramPlugin {
 	 * 
 	 * @param tool The plugin tool that this plugin is added to.
 	 */
-	public MWOS9MipsPlugin(PluginTool tool) {
+	public OS9MipsPlugin(PluginTool tool) {
 		super(tool, true, true);
 
 		// TODO: Customize provider (or remove if a provider is not desired)

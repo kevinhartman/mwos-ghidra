@@ -21,7 +21,7 @@ import ghidra.util.exception.AssertException;
 import ghidra.util.exception.CancelledException;
 import ghidra.util.task.TaskMonitor;
 
-public class MWOS9MipsAnalyzer extends MipsAddressAnalyzer {
+public class OS9MipsAnalyzer extends MipsAddressAnalyzer {
     private static final String OPTION_NAME_CONST_CP = "(Microware OS9) Assume CP value";
 	private static final String OPTION_DESCRIPTION_CONST_CP =
 		"Assume CP ($s8) is biased code pointer (use for MWOS9 program modules).";
@@ -31,7 +31,7 @@ public class MWOS9MipsAnalyzer extends MipsAddressAnalyzer {
 	private Register cp;
 	private Address cp_assumption_value = null;
 
-	public MWOS9MipsAnalyzer() {
+	public OS9MipsAnalyzer() {
 		super();
 	}
 
